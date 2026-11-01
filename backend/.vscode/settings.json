@@ -1,0 +1,5 @@
+
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/.esp32_be/bin/python",
+    "python.terminal.activateEnvironment": true
+}
