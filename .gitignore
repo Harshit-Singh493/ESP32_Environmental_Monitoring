@@ -1,0 +1,17 @@
+# --- Python / Backend ---
+backend/.env
+backend/.esp32_be/
+backend/__pycache__/
+backend/*.pkl
+backend/*.pt
+
+# --- Node.js / Frontend ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# --- OS / IDE Files ---
+.DS_Store
+.vscode/
+
+sketch/config.h
