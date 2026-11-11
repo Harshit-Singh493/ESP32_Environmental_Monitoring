@@ -2,48 +2,59 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score
 import joblib
 
 print("Initializing Rain Classifier training...")
 
-# 1. Load data or generate a synthetic training set if CSV doesn't exist yet
 try:
     df = pd.read_csv("weather_logs.csv")
-    print("Loaded existing weather_logs.csv dataset.")
+    print(f"Loaded existing weather_logs.csv dataset with {len(df)} rows.")
 except FileNotFoundError:
-    print("weather_logs.csv not found. Generating sample training dataset...")
-    np.random.seed(42)
-    n_samples = 2000
-    df = pd.DataFrame({
-        'temperature_c': np.random.uniform(15.0, 38.0, n_samples),
-        'humidity_pct': np.random.uniform(30.0, 98.0, n_samples),
-        'pressure_hpa': np.random.uniform(990.0, 1025.0, n_samples),
-        'rain_raw': np.random.randint(0, 4095, n_samples)
-    })
-    # Realistic heuristic labels for training mock data
-    df['pressure_delta'] = df['pressure_hpa'].diff().fillna(0)
-    df['is_raining'] = ((df['humidity_pct'] > 76.0) & (df['pressure_delta'] < -0.2)).astype(int)
-    df.to_csv("weather_logs.csv", index=False)
+    print("weather_logs.csv not found. Please run export_data.py first.")
+    exit()
 
-# 2. Feature Engineering
+# 1. Feature Engineering: Calculate pressure delta
 df['pressure_delta'] = df['pressure_hpa'].diff().fillna(0)
-df.dropna(inplace=True)
+
+# 2. Create the missing target label
+# Since the DB only stores raw analog values, we generate the binary label here:
+df['is_raining'] = ((df['humidity_pct'] > 75.0) & (df['pressure_delta'] < -0.2)).astype(int)
+
+# 3. Drop NaNs (using the modern Pandas 3.x syntax to fix your warning)
+df = df.dropna()
 
 X = df[['humidity_pct', 'pressure_delta', 'temperature_c', 'rain_raw']]
 y = df['is_raining']
 
-# 3. Train-Test Split
+# 4. Handle the "No Rain Yet" edge case
+if len(y.unique()) < 2:
+    print("Notice: Your real data only contains dry weather so far.")
+    print("Injecting a few synthetic rainy rows so the classifier can compile...")
+    
+    synthetic_rain = pd.DataFrame({
+        'humidity_pct': [90.0, 95.0, 88.0, 92.0],
+        'pressure_delta': [-1.5, -2.0, -0.8, -1.2],
+        'temperature_c': [22.0, 21.5, 23.0, 22.8],
+        'rain_raw': [1500, 1200, 1800, 1400],
+        'is_raining': [1, 1, 1, 1]
+    })
+    
+    df = pd.concat([df, synthetic_rain], ignore_index=True)
+    X = df[['humidity_pct', 'pressure_delta', 'temperature_c', 'rain_raw']]
+    y = df['is_raining']
+
+# 5. Train-Test Split
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# 4. Model Training
+# 6. Model Training
 clf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
 clf.fit(X_train, y_train)
 
-# 5. Evaluation
+# 7. Evaluation
 preds = clf.predict(X_test)
 print(f"Test Accuracy: {accuracy_score(y_test, preds) * 100:.2f}%")
 
-# 6. Save Model
+# 8. Save Model
 joblib.dump(clf, "rain_classifier.pkl")
 print("Success! Model saved to rain_classifier.pkl")
