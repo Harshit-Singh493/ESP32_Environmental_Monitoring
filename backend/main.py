@@ -1,34 +1,36 @@
 import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 import joblib
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Optional, List
-from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sklearn.ensemble import RandomForestClassifier
 from sqlalchemy import (
-    create_engine,
-    Integer,
-    Float,
-    String,
     Boolean,
     DateTime,
+    Float,
+    Integer,
+    String,
+    create_engine,
     select,
     text,
 )
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
+    Session,
     mapped_column,
     sessionmaker,
-    Session,
 )
-from sqlalchemy.exc import SQLAlchemyError
+import torch
+import torch.nn as nn
 
 
 # =====================================================
@@ -42,13 +44,14 @@ if not DATABASE_URL:
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:5174"
+    "http://localhost:5173,http://localhost:5174",
 )
 origins = [origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()]
 
-# Global holders for trained ML models
+# Global holders for trained ML models and feature scaler
 rain_classifier_model = None
 lstm_temp_model = None
+lstm_scaler = None
 SEQUENCE_LENGTH = 24  # Lookback timesteps required for LSTM
 
 
@@ -58,7 +61,9 @@ SEQUENCE_LENGTH = 24  # Lookback timesteps required for LSTM
 class TemperatureLSTM(nn.Module):
     def __init__(self, input_dim=3, hidden_dim=64, num_layers=2, output_dim=1):
         super(TemperatureLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.2)
+        self.lstm = nn.LSTM(
+            input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.2
+        )
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
@@ -73,8 +78,10 @@ class TemperatureLSTM(nn.Module):
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+
 class Base(DeclarativeBase):
     pass
+
 
 class SensorReadingDB(Base):
     __tablename__ = "sensor_readings"
@@ -82,7 +89,9 @@ class SensorReadingDB(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     device_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     timestamp_utc: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    received_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    received_at_utc: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     uptime_ms: Mapped[int] = mapped_column(Integer, nullable=False)
 
     temperature_c: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -109,7 +118,7 @@ class SensorReadingDB(Base):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global rain_classifier_model, lstm_temp_model
+    global rain_classifier_model, lstm_temp_model, lstm_scaler
     print("Initializing database and loading ML models...")
     Base.metadata.create_all(bind=engine)
 
@@ -123,17 +132,26 @@ async def lifespan(app: FastAPI):
     else:
         print("Notice: rain_classifier.pkl not found. Classifier will use heuristic fallback.")
 
-    # Load PyTorch LSTM Temperature Model
-    if os.path.exists("lstm_temp_model.pt"):
+    # Load PyTorch LSTM Temperature Model & StandardScaler
+    if os.path.exists("lstm_temp_model.pt") and os.path.exists("lstm_scaler.joblib"):
         try:
-            lstm_temp_model = TemperatureLSTM(input_dim=3, hidden_dim=64, num_layers=2, output_dim=1)
-            lstm_temp_model.load_state_dict(torch.load("lstm_temp_model.pt", map_location=torch.device('cpu')))
-            lstm_temp_model.eval()
-            print("Loaded lstm_temp_model.pt successfully.")
+            lstm_scaler = joblib.load("lstm_scaler.joblib")
+            model = TemperatureLSTM(input_dim=3, hidden_dim=64, num_layers=2, output_dim=1)
+            model.load_state_dict(
+                torch.load("lstm_temp_model.pt", map_location=torch.device("cpu"))
+            )
+            model.eval()
+            lstm_temp_model = model
+            print("Loaded lstm_temp_model.pt and lstm_scaler.joblib successfully.")
         except Exception as e:
-            print(f"Warning: Could not load lstm_temp_model.pt: {e}")
+            lstm_temp_model = None
+            lstm_scaler = None
+            print(f"Warning: Could not load LSTM model/scaler: {e}")
     else:
-        print("Notice: lstm_temp_model.pt not found. LSTM will use heuristic fallback.")
+        print(
+            "Notice: lstm_temp_model.pt or lstm_scaler.joblib missing. "
+            "Run train_lstm.py first; LSTM will use heuristic fallback."
+        )
 
     yield
     print("FastAPI application shutting down.")
@@ -157,6 +175,7 @@ class MQ135Reading(BaseModel):
     toluene_ppm: float
     acetone_ppm: float
 
+
 class SensorReading(BaseModel):
     device_id: str = Field(min_length=1, max_length=100)
     timestamp_utc: Optional[str] = None
@@ -175,7 +194,7 @@ class SensorReading(BaseModel):
 app = FastAPI(
     title="ESP32 Environmental Monitoring & ML API",
     description="API for sensor telemetry, sequence history, and automated ML retraining.",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -186,6 +205,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 def get_db():
     db = SessionLocal()
@@ -233,45 +253,56 @@ def serialize_reading(reading: SensorReadingDB):
 # =====================================================
 def background_retrain_models():
     """
-    Pulls recent rows from PostgreSQL, retrains the Random Forest classifier 
+    Pulls recent rows from PostgreSQL, retrains the Random Forest classifier
     on the fly, and updates model weights in memory.
     """
     global rain_classifier_model
     db = SessionLocal()
     try:
-        statement = select(SensorReadingDB).order_by(SensorReadingDB.received_at_utc.desc()).limit(1000)
+        statement = (
+            select(SensorReadingDB)
+            .order_by(SensorReadingDB.received_at_utc.desc())
+            .limit(1000)
+        )
         readings = db.execute(statement).scalars().all()
-        
+
         if len(readings) < 30:
             return
 
-        data = [{
-            'temperature_c': r.temperature_c,
-            'humidity_pct': r.humidity_pct,
-            'pressure_hpa': r.pressure_hpa,
-            'rain_raw': r.rain_raw,
-            'received_at_utc': r.received_at_utc
-        } for r in readings if r.temperature_c is not None and r.humidity_pct is not None and r.pressure_hpa is not None]
-        
+        data = [
+            {
+                "temperature_c": r.temperature_c,
+                "humidity_pct": r.humidity_pct,
+                "pressure_hpa": r.pressure_hpa,
+                "rain_raw": r.rain_raw,
+                "received_at_utc": r.received_at_utc,
+            }
+            for r in readings
+            if r.temperature_c is not None
+            and r.humidity_pct is not None
+            and r.pressure_hpa is not None
+        ]
+
         df = pd.DataFrame(data)
         if df.empty:
             return
 
-        df.sort_values('received_at_utc', inplace=True)
-        df['pressure_delta'] = df['pressure_hpa'].diff().fillna(0)
-        df['is_raining'] = ((df['humidity_pct'] > 75.0) & (df['pressure_delta'] < -0.2)).astype(int)
-        
-        X = df[['humidity_pct', 'pressure_delta', 'temperature_c', 'rain_raw']]
-        y = df['is_raining']
-        
+        df.sort_values("received_at_utc", inplace=True)
+        df["pressure_delta"] = df["pressure_hpa"].diff().fillna(0)
+        df["is_raining"] = (
+            (df["humidity_pct"] > 75.0) & (df["pressure_delta"] < -0.2)
+        ).astype(int)
+
+        X = df[["humidity_pct", "pressure_delta", "temperature_c", "rain_raw"]]
+        y = df["is_raining"]
+
         if len(y.unique()) > 1:
-            from sklearn.ensemble import RandomForestClassifier
             clf = RandomForestClassifier(n_estimators=50, random_state=42)
             clf.fit(X, y)
-            
+
             joblib.dump(clf, "rain_classifier.pkl")
             rain_classifier_model = clf
-            print("Background Task: Rain Classifier successfully auto-retrained with fresh database records.")
+            print("Background Task: Rain Classifier auto-retrained with fresh records.")
     except Exception as e:
         print(f"Error in background retraining worker: {e}")
     finally:
@@ -283,7 +314,12 @@ def background_retrain_models():
 # =====================================================
 @app.get("/")
 def root():
-    return {"status": "online", "message": "Weather Station ML API Active", "docs": "/docs"}
+    return {
+        "status": "online",
+        "message": "Weather Station ML API Active",
+        "docs": "/docs",
+    }
+
 
 @app.get("/health")
 def health_check(db: Session = Depends(get_db)):
@@ -293,16 +329,18 @@ def health_check(db: Session = Depends(get_db)):
             "status": "healthy",
             "database": "connected",
             "rain_model_loaded": rain_classifier_model is not None,
-            "lstm_model_loaded": lstm_temp_model is not None
+            "lstm_model_loaded": lstm_temp_model is not None,
+            "lstm_scaler_loaded": lstm_scaler is not None,
         }
     except SQLAlchemyError:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
+
 @app.post("/api/readings", status_code=201)
 def receive_sensor_reading(
-    reading: SensorReading, 
-    background_tasks: BackgroundTasks, 
-    db: Session = Depends(get_db)
+    reading: SensorReading,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
 ):
     mq = reading.mq135
     new_reading = SensorReadingDB(
@@ -321,7 +359,7 @@ def receive_sensor_reading(
         mq135_calibrated=mq.calibrated,
         mq135_r0_kohm=mq.r0_kohm,
         mq135_rs_kohm=mq.rs_kohm,
-        mq135_rs_r0_ratio=mq.ratio if hasattr(mq, 'ratio') else mq.rs_r0_ratio,
+        mq135_rs_r0_ratio=mq.ratio if hasattr(mq, "ratio") else mq.rs_r0_ratio,
         co2_ppm=mq.co2_ppm,
         ammonia_ppm=mq.ammonia_ppm,
         carbon_monoxide_ppm=mq.carbon_monoxide_ppm,
@@ -337,10 +375,9 @@ def receive_sensor_reading(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to store reading: {e}")
 
-    # Trigger background model retraining asynchronously
     background_tasks.add_task(background_retrain_models)
-
     return {"status": "success", "reading_id": new_reading.id}
+
 
 @app.get("/api/readings")
 def get_all_readings(
@@ -352,12 +389,22 @@ def get_all_readings(
     statement = select(SensorReadingDB)
     if device_id:
         statement = statement.where(SensorReadingDB.device_id == device_id)
-    statement = statement.order_by(SensorReadingDB.received_at_utc.desc()).offset(skip).limit(limit)
+    statement = (
+        statement.order_by(SensorReadingDB.received_at_utc.desc())
+        .offset(skip)
+        .limit(limit)
+    )
     readings = db.execute(statement).scalars().all()
-    return {"count": len(readings), "readings": [serialize_reading(r) for r in readings]}
+    return {
+        "count": len(readings),
+        "readings": [serialize_reading(r) for r in readings],
+    }
+
 
 @app.get("/api/readings/latest")
-def get_latest_reading(device_id: Optional[str] = None, db: Session = Depends(get_db)):
+def get_latest_reading(
+    device_id: Optional[str] = None, db: Session = Depends(get_db)
+):
     statement = select(SensorReadingDB)
     if device_id:
         statement = statement.where(SensorReadingDB.device_id == device_id)
@@ -366,6 +413,7 @@ def get_latest_reading(device_id: Optional[str] = None, db: Session = Depends(ge
     if not reading:
         raise HTTPException(status_code=404, detail="No readings found")
     return serialize_reading(reading)
+
 
 @app.get("/api/ml/history")
 def get_ml_historical_sequence(
@@ -378,10 +426,10 @@ def get_ml_historical_sequence(
         statement = statement.where(SensorReadingDB.device_id == device_id)
     statement = statement.order_by(SensorReadingDB.received_at_utc.desc()).limit(limit)
     readings = db.execute(statement).scalars().all()
-    readings.reverse()  # Oldest to newest chronological order for LSTM sequence
+    readings.reverse()
     return {
         "sequence_length": len(readings),
-        "readings": [serialize_reading(r) for r in readings]
+        "readings": [serialize_reading(r) for r in readings],
     }
 
 
@@ -390,66 +438,106 @@ def get_ml_historical_sequence(
 # =====================================================
 @app.post("/api/ml/infer/temperature-lstm")
 def infer_temperature_lstm(
-    horizon_hours: int = Query(default=1, ge=1, le=12, description="Hours ahead to forecast"),
-    device_id: Optional[str] = None, 
-    db: Session = Depends(get_db)
+    horizon_hours: int = Query(
+        default=1, ge=1, le=12, description="Hours ahead to forecast"
+    ),
+    device_id: Optional[str] = None,
+    db: Session = Depends(get_db),
 ):
-    statement = select(SensorReadingDB).order_by(SensorReadingDB.received_at_utc.desc()).limit(SEQUENCE_LENGTH)
+    statement = select(SensorReadingDB).where(
+        SensorReadingDB.temperature_c.is_not(None),
+        SensorReadingDB.humidity_pct.is_not(None),
+        SensorReadingDB.pressure_hpa.is_not(None),
+    )
+    if device_id:
+        statement = statement.where(SensorReadingDB.device_id == device_id)
+
+    statement = statement.order_by(SensorReadingDB.received_at_utc.desc()).limit(
+        SEQUENCE_LENGTH
+    )
     readings = db.execute(statement).scalars().all()
-    
+
     if len(readings) < 5:
-        raise HTTPException(status_code=400, detail="Insufficient historical data for LSTM sequence inference.")
+        raise HTTPException(
+            status_code=400,
+            detail="Insufficient valid sensor data for LSTM sequence inference.",
+        )
 
-    readings.reverse()  # Chronological order
-    latest_temp = readings[-1].temperature_c if readings[-1].temperature_c is not None else 25.0
+    readings.reverse()  # Oldest to newest chronological order
+    latest_temp = float(readings[-1].temperature_c)
 
-    if lstm_temp_model is not None:
+    if lstm_temp_model is not None and lstm_scaler is not None:
         try:
             feature_window = [
                 [
-                    r.temperature_c if r.temperature_c is not None else 0.0,
-                    r.humidity_pct if r.humidity_pct is not None else 0.0,
-                    r.pressure_hpa if r.pressure_hpa is not None else 1013.0
+                    float(r.temperature_c),
+                    float(r.humidity_pct),
+                    float(r.pressure_hpa),
                 ]
                 for r in readings
             ]
-            
+
+            # Pad oldest reading forward if fewer than SEQUENCE_LENGTH valid rows exist
             if len(feature_window) < SEQUENCE_LENGTH:
                 padding = [feature_window[0]] * (SEQUENCE_LENGTH - len(feature_window))
                 feature_window = padding + feature_window
             else:
                 feature_window = feature_window[-SEQUENCE_LENGTH:]
 
-            input_tensor = torch.tensor([feature_window], dtype=torch.float32)
+            # Normalize features using the exact StandardScaler fitted during training
+            raw_array = np.array(feature_window, dtype=np.float32)
+            scaled_array = lstm_scaler.transform(raw_array)
+            current_seq = torch.tensor(scaled_array, dtype=torch.float32).unsqueeze(0)
+
+            # Autoregressive multi-step rollout for the requested horizon_hours
             with torch.no_grad():
-                prediction = lstm_temp_model(input_tensor)
-                base_forecast = float(prediction.item())
-                
-            # Scale prediction slightly further out based on requested horizon hours
-            # (In a production multi-step LSTM, you'd feed predictions back recursively)
-            forecast_temp = base_forecast + ((horizon_hours - 1) * 0.3)
-            
+                next_temp_scaled = 0.0
+                for _ in range(horizon_hours):
+                    pred = lstm_temp_model(current_seq)
+                    next_temp_scaled = float(pred.item())
+
+                    # Carry forward latest scaled humidity & pressure alongside predicted temp
+                    last_humidity_scaled = current_seq[0, -1, 1].item()
+                    last_pressure_scaled = current_seq[0, -1, 2].item()
+                    next_step = torch.tensor(
+                        [[[next_temp_scaled, last_humidity_scaled, last_pressure_scaled]]],
+                        dtype=torch.float32,
+                    )
+                    current_seq = torch.cat([current_seq[:, 1:, :], next_step], dim=1)
+
+            # Invert StandardScaler for column 0 (temperature_c)
+            forecast_temp = (next_temp_scaled * float(lstm_scaler.scale_[0])) + float(
+                lstm_scaler.mean_[0]
+            )
+
         except Exception as e:
             print(f"LSTM Inference error: {e}")
-            forecast_temp = latest_temp + (horizon_hours * 0.3)
+            forecast_temp = latest_temp
     else:
-        forecast_temp = latest_temp + (horizon_hours * 0.3)
+        forecast_temp = latest_temp
 
     return {
         "model": "LSTM-Temperature-Forecaster",
         "input_timesteps_used": len(readings),
         "forecast_horizon": f"+{horizon_hours} hour(s)",
-        "predicted_temperature_c": round(forecast_temp, 2)
+        "predicted_temperature_c": round(forecast_temp, 2),
     }
 
 
 @app.post("/api/ml/infer/rain-classifier")
-def infer_rain_classifier(device_id: Optional[str] = None, db: Session = Depends(get_db)):
-    statement = select(SensorReadingDB).order_by(SensorReadingDB.received_at_utc.desc()).limit(2)
+def infer_rain_classifier(
+    device_id: Optional[str] = None, db: Session = Depends(get_db)
+):
+    statement = select(SensorReadingDB)
+    if device_id:
+        statement = statement.where(SensorReadingDB.device_id == device_id)
+    statement = statement.order_by(SensorReadingDB.received_at_utc.desc()).limit(2)
     readings = db.execute(statement).scalars().all()
-    
+
     if not readings:
-        raise HTTPException(status_code=404, detail="No sensor readings available for inference.")
+        raise HTTPException(
+            status_code=404, detail="No sensor readings available for inference."
+        )
 
     latest = readings[0]
     pressure_delta = 0.0
@@ -478,8 +566,8 @@ def infer_rain_classifier(device_id: Optional[str] = None, db: Session = Depends
         "features_evaluated": {
             "humidity_pct": humidity,
             "pressure_delta_hpa": round(pressure_delta, 2),
-            "rain_sensor_adc": rain_raw
+            "rain_sensor_adc": rain_raw,
         },
         "will_rain": bool(prediction),
-        "rain_probability": round(probability, 2)
+        "rain_probability": round(probability, 2),
     }
